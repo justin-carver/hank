@@ -1,3 +1,4 @@
+mod init;
 fn main() {
-    println!("Hello, world!");
+    let _ = init::init_prompt(true);
 }
