@@ -1,4 +1,12 @@
+mod config;
 mod init;
+
 fn main() {
-    let _ = init::init_prompt(true);
+    let user_responses = init::init_prompt(true);
+    match user_responses {
+        Ok(res) => {
+            println!("{:#?}", res) // debug for later
+        }
+        Err(_) => todo!(),
+    }
 }

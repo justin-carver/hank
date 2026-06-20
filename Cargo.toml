@@ -3,5 +3,11 @@ name = "hank"
 version = "0.1.0"
 edition = "2024"
 
+[term]
+color = "always"
+
 [dependencies]
 cliclack = "0.5.4"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
