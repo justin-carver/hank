@@ -1,38 +1,61 @@
-use cliclack::{confirm, input, intro, log, note, outro};
+use cliclack::{confirm, input, intro, log, multiselect, outro};
 use regex::Regex;
-use std::{env, io, ops::ControlFlow::Break, path::Path, process};
+use std::{env, path::Path, process};
 
-use crate::config::{self, BoxError, read_or_create, write_json};
+use console::style;
 
+use crate::configs::{self, ConfigFile, configs_from_paths};
+use crate::utils::{self, BoxError, write_json};
+
+// TODO: These should probably make more sense, or take in some sort of data.
 #[derive(Debug)]
 pub enum PromptError {
     CoreInitFailure,
     CanceledPrompt,
     ResponseLength,
     SaveFailure,
+    UnableToFindTool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct InitResponses {
+pub struct InitResponses<'a> {
     gh_username: String,
     gh_repo_name: String,
     local_path: String,
+    configs: Vec<&'a ConfigFile>,
+}
+
+impl InitResponses<'_> {
+    /// Regex comparison against official GitHub username requirements.
+    /// The [Regex] crate apparently does not support `lookaround` comparators,
+    /// so the matching is a little more manual than normal regex.
+    fn regex_gh_username(user: &String) -> bool {
+        let rgx_gh = Regex::new(r"^[a-zA-Z0-9](?:[a-zA-Z0-9]|-[a-zA-Z0-9])*$").unwrap();
+        if !user.is_empty() && user.len() <= 39 && rgx_gh.is_match(user) {
+            true
+        } else {
+            false
+        }
+    }
+    /// Regex processing against Unix-styled paths
+    fn regex_unix_path(path: &String) -> bool {
+        let rgx_path = Regex::new(
+            r"^(?:~[\w.-]*(?:\/[\w.-]+)*|\/(?:[\w.-]+(?:\/[\w.-]+)*)?|[\w.-]+(?:\/[\w.-]+)*)\/?$",
+        )
+        .unwrap();
+        if rgx_path.is_match(path) { true } else { false }
+    }
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-struct Config {
+struct Meta {
     name: String,
     retries: u8,
 }
 
 // TODO: Need to do checks for things like Git repo settings, and metadata.json
 /// Initializes the prompt for the first time user.
-pub fn init_prompt(c: bool) -> Result<InitResponses, PromptError> {
-    let rgx_path = Regex::new(
-        r"^(?:~[\w.-]*(?:\/[\w.-]+)*|\/(?:[\w.-]+(?:\/[\w.-]+)*)?|[\w.-]+(?:\/[\w.-]+)*)\/?$",
-    )
-    .unwrap();
-
+pub fn init_prompt(c: bool) -> Result<InitResponses<'static>, PromptError> {
     if c {
         intro(format!(
             "Hey, {}! Let's figure out what we need to sync!",
@@ -40,25 +63,27 @@ pub fn init_prompt(c: bool) -> Result<InitResponses, PromptError> {
         ))
         .map_err(|_| PromptError::CoreInitFailure)?;
         let _ = cliclack::note(
-            "Before we start...",
+            style(" Before we start... ").on_cyan().black(),
             "While Hank is very unopinionated, we want to make sure you control\n\
             when and where your config files get saved, stored, and synced.\n\
+            To do so, we'll need some info first about finding your files.\n\
             By canceling this prompt, we won't push or init any settings.\n\n",
         );
-        let username: String = input("What is your GitHub username? (Do not include @)")
+        let username: String = input("What is your GitHub username?")
             .placeholder("john-smith")
-            .validate(|input: &String| {
-                if input.is_empty() {
-                    // TODO: Check GitHub's *actual* username requirements
+            .validate(move |input: &String| {
+                if input.is_empty() && !InitResponses::regex_gh_username(input) {
                     Err("Please specify a valid GitHub username.")
+                } else if input.starts_with("@") {
+                    Err("Do not include the @ symbol.")
                 } else {
                     Ok(())
                 }
             })
             .interact()
-            .map_err(|e| PromptError::CanceledPrompt)?;
+            .map_err(|_| PromptError::CanceledPrompt)?;
         let mut repo_name: String =
-            input("What is the name of the repo hosting your config files?")
+            input("What is the name of the repo hosting your config files? (dotfiles)")
                 .placeholder("dotfiles")
                 .required(false)
                 .interact()
@@ -72,21 +97,20 @@ pub fn init_prompt(c: bool) -> Result<InitResponses, PromptError> {
                 .validate(move |input: &String| {
                     if input.is_empty() {
                         Err("Please enter a path.")
-                        // FIXME: This needs to be resolved better. Need a function to regex map valid filepaths.
-                    } else if !rgx_path.is_match(input) {
+                    } else if !InitResponses::regex_unix_path(input) {
                         Err("Please enter a valid path")
                     } else {
                         Ok(())
                     }
                 })
                 .interact()
-                .map_err(|e| PromptError::CanceledPrompt)?;
+                .map_err(|_| PromptError::CanceledPrompt)?;
 
         let combined_path = [&path, "/meta.json"].concat();
-        if config::exists(combined_path) {
+        if utils::exists(combined_path) {
             let overwrite = confirm(format!(
-                "There already exists a meta.json located in:\n\n{}\n\n{}",
-                &path, "Do you want to overwite this file with your answers above?"
+                "There already exists a meta.json located in:\n\n\x1b[1;33m{}\x1b[0m\n\n{}",
+                &path, "Do you want to overwite this file with your answers above?\n(All data will be lost)"
             ))
             .interact()
             .map_err(|e| PromptError::SaveFailure)?;
@@ -95,10 +119,38 @@ pub fn init_prompt(c: bool) -> Result<InitResponses, PromptError> {
                 process::exit(1);
             }
         }
+        log::info("Let's scan for what configs you have on this machine already...")
+            .map_err(|_| PromptError::CanceledPrompt)?;
+
+        // The good stuff, finding what config files to start syncing
+        let spinner = cliclack::spinner();
+        spinner.start("Finding configuration files...");
+
+        let mut tools: Vec<(String, String, String)> = Vec::new();
+        let total_configs = configs::existing();
+        for cfg in &total_configs {
+            // We need to push them in a certain order for readability
+            tools.push((
+                cfg.path.to_string(), // true value
+                cfg.tool.to_string(), // displayed text in prompt
+                [cfg.base.to_string(), "/".to_string(), cfg.path.to_string()].concat(), // hint
+            ));
+        }
+        tools.sort_by_key(|k| k.1.to_lowercase());
+        spinner.stop(format!("Found {} files!", total_configs.len()));
+
+        let found_configs = multiselect("Choose which configs to track.")
+            .items(&tools)
+            .interact()
+            .map_err(|_| PromptError::UnableToFindTool)?;
+        let tracked_configs = configs_from_paths(found_configs);
+
+        // Try ending the prompts and sending data to disk
         let res: InitResponses = InitResponses {
             gh_username: username,
             gh_repo_name: repo_name,
             local_path: path,
+            configs: tracked_configs,
         };
         // Write all responses to `meta.json` file, stored in the preferred local directory
         outro("All set! Use `hank list` to show tracked config changes.")
@@ -116,15 +168,11 @@ fn parse_init_responses(res: InitResponses) -> Result<InitResponses, BoxError> {
 }
 
 // ::: Tests :::
+// TODO: Should these be moved to their own /test folder?
 
 // Unix-only path validation
 #[test]
 fn test_validate_unix_path_regex() {
-    let rgx_path = Regex::new(
-        r"^(?:~[\w.-]*(?:/[\w.-]+)*|/(?:[\w.-]+(?:/[\w.-]+)*)?|[\w.-]+(?:/[\w.-]+)*)/?$",
-    )
-    .unwrap();
-
     // (input, should_match)
     let cases: &[(&str, bool)] = &[
         // valid — home / absolute / relative
@@ -147,7 +195,47 @@ fn test_validate_unix_path_regex() {
     ];
 
     for &(input, expected) in cases {
-        let got = rgx_path.is_match(input);
+        let got = InitResponses::regex_unix_path(&input.to_string());
         assert_eq!(got, expected, "{input:?}: expected {expected}, got {got}");
     }
+}
+
+// GitHub username validation
+#[test]
+fn test_validate_github_username_regex() {
+    // (input, should_match)
+    let cases: &[(&str, bool)] = &[
+        ("john", true),
+        ("john-smith", true),
+        ("a", true),
+        ("user123", true),
+        ("user-name", true),
+        ("something-like-a-really-long-username-1", true),
+        ("", false),
+        ("-starts", false),
+        ("ends-", false),
+        ("@john", false),
+        ("john--doe", false),
+        ("john_doe", false),
+        ("john.doe", false),
+        ("john_doe!", false),
+    ];
+
+    for &(input, expected) in cases {
+        let got = !input.is_empty()
+            && input.len() <= 39
+            && InitResponses::regex_gh_username(&input.to_string());
+        assert_eq!(
+            got, expected,
+            "{:?}: expected {}, got {}",
+            input, expected, got
+        );
+    }
+
+    // Too long (>39 chars) should be invalid
+    let long = "a".repeat(40);
+    assert!(
+        !InitResponses::regex_gh_username(&long.to_string()),
+        "40 'a's should be invalid"
+    );
 }

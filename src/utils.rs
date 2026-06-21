@@ -99,7 +99,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-    struct Config {
+    struct Meta {
         name: String,
         retries: u32,
         paths: Vec<String>,
@@ -112,14 +112,14 @@ mod tests {
         let _ = fs::remove_file(&path); // start clean
 
         // File is missing -> default is written and returned.
-        let cfg: Config = read_or_create(&path, Config::default).unwrap();
-        assert_eq!(cfg, Config::default());
+        let cfg: Meta = read_or_create(&path, Meta::default).unwrap();
+        assert_eq!(cfg, Meta::default());
         assert!(exists(&path));
 
         // Mutate on disk, then read it back.
-        let updated = update_json(&path, |c: &mut Config| c.retries = 5).unwrap();
+        let updated = update_json(&path, |c: &mut Meta| c.retries = 5).unwrap();
         assert_eq!(updated.retries, 5);
-        let reloaded: Config = read_json(&path).unwrap();
+        let reloaded: Meta = read_json(&path).unwrap();
         assert_eq!(reloaded.retries, 5);
 
         let _ = fs::remove_file(&path);
