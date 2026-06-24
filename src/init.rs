@@ -4,28 +4,28 @@ use std::{env, path::Path, process};
 
 use console::style;
 
-use crate::configs::{self, ConfigFile, configs_from_paths};
-use crate::utils::{self, BoxError, write_json};
+use crate::configs::{self, ConfigList, TrackedConfig, configs_from_paths};
+use crate::utils::{self, BoxError, get_metadata_path, write_json};
 
 // TODO: These should probably make more sense, or take in some sort of data.
 #[derive(Debug)]
 pub enum PromptError {
     CoreInitFailure,
     CanceledPrompt,
-    ResponseLength,
+    NoUserResponse,
     SaveFailure,
     UnableToFindTool,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct InitResponses<'a> {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Metadata {
     gh_username: String,
     gh_repo_name: String,
     local_path: String,
-    configs: Vec<&'a ConfigFile>,
+    pub tracked: ConfigList,
 }
 
-impl InitResponses<'_> {
+impl Metadata {
     /// Regex comparison against official GitHub username requirements.
     /// The [Regex] crate apparently does not support `lookaround` comparators,
     /// so the matching is a little more manual than normal regex.
@@ -47,15 +47,16 @@ impl InitResponses<'_> {
     }
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct Meta {
-    name: String,
-    retries: u8,
-}
+// #[derive(Default, serde::Serialize, serde::Deserialize)]
+// struct Meta {
+//     name: String,
+//     retries: u8,
+// }
 
+// TODO: This needs to be refactored to high-hell.
 // TODO: Need to do checks for things like Git repo settings, and metadata.json
 /// Initializes the prompt for the first time user.
-pub fn init_prompt(c: bool) -> Result<InitResponses<'static>, PromptError> {
+pub fn init_prompt(c: bool) -> Result<Metadata, PromptError> {
     if c {
         intro(format!(
             "Hey, {}! Let's figure out what we need to sync!",
@@ -72,7 +73,7 @@ pub fn init_prompt(c: bool) -> Result<InitResponses<'static>, PromptError> {
         let username: String = input("What is your GitHub username?")
             .placeholder("john-smith")
             .validate(move |input: &String| {
-                if input.is_empty() && !InitResponses::regex_gh_username(input) {
+                if input.is_empty() && !Metadata::regex_gh_username(input) {
                     Err("Please specify a valid GitHub username.")
                 } else if input.starts_with("@") {
                     Err("Do not include the @ symbol.")
@@ -91,23 +92,35 @@ pub fn init_prompt(c: bool) -> Result<InitResponses<'static>, PromptError> {
         if repo_name.is_empty() {
             repo_name = String::from("dotfiles");
         }
-        let path: String =
-            input("Where should we store your pending config changes before pushing?")
-                .placeholder("~/local/pending/changes")
-                .validate(move |input: &String| {
-                    if input.is_empty() {
-                        Err("Please enter a path.")
-                    } else if !InitResponses::regex_unix_path(input) {
-                        Err("Please enter a valid path")
-                    } else {
-                        Ok(())
-                    }
-                })
-                .interact()
-                .map_err(|_| PromptError::CanceledPrompt)?;
-
-        let combined_path = [&path, "/meta.json"].concat();
-        if utils::exists(combined_path) {
+        let path: String = input("Where should the repo be cloned to?")
+            .placeholder("~/local/pending/changes")
+            .validate(move |input: &String| {
+                if input.is_empty() {
+                    Err("Please enter a path.")
+                } else if !Metadata::regex_unix_path(input) {
+                    Err("Please enter a valid path")
+                } else {
+                    Ok(())
+                }
+            })
+            .interact()
+            .map_err(|_| PromptError::CanceledPrompt)?;
+        // Looks like there's already a github repo in this location. Continue?
+        if utils::exists([&path, "/.git"].concat()) {
+            let proceed = confirm(format!(
+                "This directory seems to already include a \
+            \x1b[1;33m.git\x1b[0m repository.\nIt's highly recommended to start in a fresh folder.\n\n\
+            Do you want to continue? Files outside of Hank's vision will not be tracked."
+            ))
+            .interact()
+            .map_err(|e| PromptError::SaveFailure)?;
+            if !proceed {
+                println!("User chose to abort! Re-run \x1b[1;33mhank init\x1b[0m to try again.");
+                process::exit(1);
+            }
+        }
+        // There seems to be a meta.json file here! Should we overwrite?
+        if utils::exists([&path, "/meta.json"].concat()) {
             let overwrite = confirm(format!(
                 "There already exists a meta.json located in:\n\n\x1b[1;33m{}\x1b[0m\n\n{}",
                 &path, "Do you want to overwite this file with your answers above?\n(All data will be lost)"
@@ -146,24 +159,30 @@ pub fn init_prompt(c: bool) -> Result<InitResponses<'static>, PromptError> {
         let tracked_configs = configs_from_paths(found_configs);
 
         // Try ending the prompts and sending data to disk
-        let res: InitResponses = InitResponses {
+        let res: Metadata = Metadata {
             gh_username: username,
             gh_repo_name: repo_name,
             local_path: path,
-            configs: tracked_configs,
+            tracked: ConfigList::new(
+                tracked_configs
+                    .into_iter()
+                    .map(TrackedConfig::from)
+                    .collect(),
+            ),
         };
         // Write all responses to `meta.json` file, stored in the preferred local directory
         outro("All set! Use `hank list` to show tracked config changes.")
             .map_err(|_| PromptError::SaveFailure)?;
         Ok(parse_init_responses(res).unwrap())
     } else {
-        Err(PromptError::CanceledPrompt)
+        Err(PromptError::NoUserResponse)
     }
 }
 
-fn parse_init_responses(res: InitResponses) -> Result<InitResponses, BoxError> {
-    let path = Path::new(&res.local_path).join("meta.json");
-    write_json(&path, &res)?;
+// TODO: Should be renamed to something more apt like `create_metadata_file()`
+fn parse_init_responses(res: Metadata) -> Result<Metadata, BoxError> {
+    let path = get_metadata_path();
+    write_json(path?, &res)?;
     Ok(res)
 }
 
@@ -195,7 +214,7 @@ fn test_validate_unix_path_regex() {
     ];
 
     for &(input, expected) in cases {
-        let got = InitResponses::regex_unix_path(&input.to_string());
+        let got = Metadata::regex_unix_path(&input.to_string());
         assert_eq!(got, expected, "{input:?}: expected {expected}, got {got}");
     }
 }
@@ -224,7 +243,7 @@ fn test_validate_github_username_regex() {
     for &(input, expected) in cases {
         let got = !input.is_empty()
             && input.len() <= 39
-            && InitResponses::regex_gh_username(&input.to_string());
+            && Metadata::regex_gh_username(&input.to_string());
         assert_eq!(
             got, expected,
             "{:?}: expected {}, got {}",
@@ -235,7 +254,7 @@ fn test_validate_github_username_regex() {
     // Too long (>39 chars) should be invalid
     let long = "a".repeat(40);
     assert!(
-        !InitResponses::regex_gh_username(&long.to_string()),
+        !Metadata::regex_gh_username(&long.to_string()),
         "40 'a's should be invalid"
     );
 }

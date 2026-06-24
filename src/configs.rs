@@ -25,12 +25,15 @@
 //! }
 //! ```
 
+use chrono::{DateTime, Utc};
 use std::env;
 use std::path::PathBuf;
 use strum::Display;
 
 /// Where a config file's relative path is anchored.
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(
+    Debug, Display, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Base {
     /// Relative to the user's home directory (`$HOME`). Legacy dotfiles.
     #[strum(serialize = "~")]
@@ -47,7 +50,12 @@ pub enum Base {
 }
 
 /// A single known configuration file for a CLI tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+///
+/// This is a *compile-time catalog* entry: its `&'static str` fields point at
+/// string literals baked into the binary, so it's zero-cost and `Copy`. It is
+/// deliberately **not** `Deserialize` — see [`TrackedConfig`] for the owned,
+/// persistable counterpart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConfigFile {
     /// The tool this config belongs to (e.g. "git", "nvim").
     pub tool: &'static str,
@@ -55,6 +63,41 @@ pub struct ConfigFile {
     pub base: Base,
     /// Path relative to `base` (e.g. ".gitconfig", "nvim/init.lua").
     pub path: &'static str,
+}
+
+/// An owned, serializable snapshot of a [`ConfigFile`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TrackedConfig {
+    pub tool: String,
+    pub base: Base,
+    pub path: String,
+}
+
+impl From<&ConfigFile> for TrackedConfig {
+    fn from(cfg: &ConfigFile) -> Self {
+        TrackedConfig {
+            tool: cfg.tool.to_owned(),
+            base: cfg.base,
+            path: cfg.path.to_owned(),
+        }
+    }
+}
+
+/// Multiple configuration files within a struct, typically used to verify,
+/// compare, or separate various [TrackedConfig] data types.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConfigList {
+    pub configs: Vec<TrackedConfig>,
+    pub last_updated: DateTime<Utc>,
+}
+
+impl ConfigList {
+    pub fn new(configs: Vec<TrackedConfig>) -> Self {
+        ConfigList {
+            configs,
+            last_updated: Utc::now(),
+        }
+    }
 }
 
 impl ConfigFile {
