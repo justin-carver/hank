@@ -1,8 +1,9 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Boxed, thread-safe error so these helpers compose with `?` across both
 /// `std::io::Error` and `serde_json::Error` (and play nicely with `anyhow`).
@@ -91,6 +92,14 @@ where
     f(&mut value);
     write_json(&path, &value)?;
     Ok(value)
+}
+
+/// `Metadata.json` should always be relative to the [hank] binary.
+pub fn get_metadata_path() -> Result<PathBuf, BoxError> {
+    let mut exe_path = env::current_exe()?;
+    exe_path.pop();
+    exe_path.push("metadata.json");
+    Ok(exe_path)
 }
 
 #[cfg(test)]
